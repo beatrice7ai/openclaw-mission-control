@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { runCliJson } from "@/lib/openclaw";
 import { fetchConfig, patchConfig } from "@/lib/gateway-config";
-import { readFile } from "fs/promises";
+import { readFile, readdir, stat } from "fs/promises";
+import { join } from "path";
+import { getOpenClawHome } from "@/lib/paths";
+
+const OPENCLAW_HOME = getOpenClawHome();
 
 export const dynamic = "force-dynamic";
 
@@ -78,6 +82,112 @@ type SkillDetail = {
   install: { id: string; kind: string; label: string; bins?: string[] }[];
 };
 
+/* ── File-based skill discovery fallback ──────────── */
+
+function parseSkillFrontMatter(raw: string): Record<string, unknown> {
+  const match = raw.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!match) return {};
+  const yaml = match[1];
+  const result: Record<string, unknown> = {};
+  // Simple YAML-like parser for flat fields (name, description, metadata)
+  for (const line of yaml.split("\n")) {
+    const kv = line.match(/^(\w+):\s*"?(.*?)"?\s*$/);
+    if (kv) {
+      result[kv[1]] = kv[2];
+    }
+  }
+  // Extract emoji from metadata block
+  const emojiMatch = raw.match(/"emoji":\s*"([^"]+)"/);
+  if (emojiMatch) result.emoji = emojiMatch[1];
+  return result;
+}
+
+async function discoverSkillsFromFilesystem(): Promise<SkillsList> {
+  const skillsDir = join(OPENCLAW_HOME, "skills");
+  const skills: Skill[] = [];
+
+  // Read skill enable/disable state from config
+  let disabledSkills = new Set<string>();
+  try {
+    const configRaw = await readFile(join(OPENCLAW_HOME, "openclaw.json"), "utf-8");
+    const config = JSON.parse(configRaw);
+    const entries = config?.skills?.entries || {};
+    for (const [name, entry] of Object.entries(entries)) {
+      if (typeof entry === "object" && entry !== null && (entry as Record<string, unknown>).enabled === false) {
+        disabledSkills.add(name);
+      }
+    }
+  } catch { /* config not readable */ }
+
+  // Scan workspace/custom skills
+  try {
+    const dirs = await readdir(skillsDir, { withFileTypes: true });
+    for (const entry of dirs) {
+      if (!entry.isDirectory()) continue;
+      const skillMdPath = join(skillsDir, entry.name, "SKILL.md");
+      try {
+        const raw = await readFile(skillMdPath, "utf-8");
+        const meta = parseSkillFrontMatter(raw);
+        const name = (meta.name as string) || entry.name;
+        const disabled = disabledSkills.has(name);
+        skills.push({
+          name,
+          description: (meta.description as string) || "",
+          emoji: (meta.emoji as string) || "🔧",
+          eligible: !disabled,
+          disabled,
+          blockedByAllowlist: false,
+          source: skillMdPath,
+          bundled: false,
+          missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
+        });
+      } catch { /* no SKILL.md */ }
+    }
+  } catch { /* skills dir doesn't exist */ }
+
+  // Also scan system skills if accessible (e.g. via shared volume)
+  const systemDirs = [
+    "/app/skills",  // inside gateway container (if mounted)
+    join(OPENCLAW_HOME, "..", ".local", "lib", "node_modules", "openclaw", "skills"),
+  ];
+  for (const sysDir of systemDirs) {
+    try {
+      const s = await stat(sysDir);
+      if (!s.isDirectory()) continue;
+      const dirs = await readdir(sysDir, { withFileTypes: true });
+      for (const entry of dirs) {
+        if (!entry.isDirectory()) continue;
+        if (skills.some((sk) => sk.name === entry.name)) continue;
+        const skillMdPath = join(sysDir, entry.name, "SKILL.md");
+        try {
+          const raw = await readFile(skillMdPath, "utf-8");
+          const meta = parseSkillFrontMatter(raw);
+          const name = (meta.name as string) || entry.name;
+          if (skills.some((sk) => sk.name === name)) continue;
+          const disabled = disabledSkills.has(name);
+          skills.push({
+            name,
+            description: (meta.description as string) || "",
+            emoji: (meta.emoji as string) || "📦",
+            eligible: !disabled,
+            disabled,
+            blockedByAllowlist: false,
+            source: skillMdPath,
+            bundled: true,
+            missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
+          });
+        } catch { /* no SKILL.md */ }
+      }
+    } catch { /* dir not accessible */ }
+  }
+
+  return {
+    workspaceDir: skillsDir,
+    managedSkillsDir: skillsDir,
+    skills: skills.sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
 /* ── GET ──────────────────────────────────────────── */
 
 export async function GET(request: NextRequest) {
@@ -95,14 +205,43 @@ export async function GET(request: NextRequest) {
       if (!name)
         return NextResponse.json({ error: "name required" }, { status: 400 });
 
-      const data = await runCliJson<SkillDetail>(["skills", "info", name]);
+      let data: SkillDetail;
+      let skillMd: string | null = null;
+
+      try {
+        data = await runCliJson<SkillDetail>(["skills", "info", name]);
+      } catch {
+        // CLI not available — build detail from filesystem
+        const skillMdPath = join(OPENCLAW_HOME, "skills", name, "SKILL.md");
+        let raw = "";
+        try {
+          raw = await readFile(skillMdPath, "utf-8");
+        } catch { /* not found */ }
+        const meta = raw ? parseSkillFrontMatter(raw) : {};
+        data = {
+          name,
+          description: (meta.description as string) || "",
+          source: skillMdPath,
+          bundled: false,
+          filePath: skillMdPath,
+          baseDir: join(OPENCLAW_HOME, "skills", name),
+          skillKey: name,
+          emoji: (meta.emoji as string) || "🔧",
+          always: false,
+          disabled: false,
+          blockedByAllowlist: false,
+          eligible: true,
+          requirements: { bins: [], anyBins: [], env: [], config: [], os: [] },
+          missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
+          configChecks: [],
+          install: [],
+        };
+      }
 
       // Try to read the SKILL.md content for display
-      let skillMd: string | null = null;
       if (data.filePath) {
         try {
           const raw = await readFile(data.filePath, "utf-8");
-          // Truncate very long files
           skillMd = raw.length > 10000 ? raw.slice(0, 10000) + "\n\n...(truncated)" : raw;
         } catch {
           // file may not be readable
@@ -152,7 +291,13 @@ export async function GET(request: NextRequest) {
     }
 
     // Default: list all skills
-    const data = await runCliJson<SkillsList>(["skills", "list"]);
+    let data: SkillsList;
+    try {
+      data = await runCliJson<SkillsList>(["skills", "list"]);
+    } catch {
+      // CLI/exec not available — fall back to filesystem discovery
+      data = await discoverSkillsFromFilesystem();
+    }
     return NextResponse.json(data);
   } catch (err) {
     console.error("Skills API error:", err);
@@ -174,13 +319,19 @@ export async function GET(request: NextRequest) {
       });
     }
     if (action === "list") {
-      return NextResponse.json({
-        workspaceDir: "",
-        managedSkillsDir: "",
-        skills: [],
-        warning: String(err),
-        degraded: true,
-      });
+      // Last resort — try filesystem even if outer try failed
+      try {
+        const fsData = await discoverSkillsFromFilesystem();
+        return NextResponse.json(fsData);
+      } catch {
+        return NextResponse.json({
+          workspaceDir: "",
+          managedSkillsDir: "",
+          skills: [],
+          warning: String(err),
+          degraded: true,
+        });
+      }
     }
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }
