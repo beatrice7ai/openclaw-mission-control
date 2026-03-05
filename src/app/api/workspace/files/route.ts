@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readdir, realpath, stat } from "fs/promises";
 import { extname, join, relative } from "path";
+import { remapGatewayPath } from "@/lib/remap-path";
 
 type WorkspaceFileRow = {
   relativePath: string;
@@ -83,9 +84,9 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  let workspacePath = rawPath;
+  let workspacePath = remapGatewayPath(rawPath);
   try {
-    workspacePath = await realpath(rawPath);
+    workspacePath = await realpath(workspacePath);
   } catch {
     // keep raw path for better error message
   }

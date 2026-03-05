@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { remapGatewayPath } from "@/lib/remap-path";
 import {
   readdir,
   readFile,
@@ -238,7 +239,7 @@ export async function PUT(request: NextRequest) {
         return NextResponse.json({ error: `unknown agent: ${agentMemory}` }, { status: 400 });
       }
 
-      const workspaceDir = String(agent.workspace || WORKSPACE);
+      const workspaceDir = remapGatewayPath(String(agent.workspace || WORKSPACE));
       const memoryFile = await readWorkspaceMemoryFile(workspaceDir, false);
       await writeFile(memoryFile.path, content, "utf-8");
 
@@ -469,7 +470,7 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ error: `unknown agent: ${agentMemory}` }, { status: 400 });
       }
 
-      const workspaceDir = String(agent.workspace || WORKSPACE);
+      const workspaceDir = remapGatewayPath(String(agent.workspace || WORKSPACE));
       const memoryFile = await readWorkspaceMemoryFile(workspaceDir, true);
       const statuses = await getMemoryStatuses();
       const indexedByWorkspace = await getIndexedMemoryFilesByWorkspace(statuses);
@@ -563,7 +564,7 @@ export async function GET(request: NextRequest) {
         .filter((a) => String(a.id || "").trim().length > 0)
         .map(async (agent) => {
           const agentId = String(agent.id || "");
-          const workspaceDir = String(agent.workspace || WORKSPACE);
+          const workspaceDir = remapGatewayPath(String(agent.workspace || WORKSPACE));
           const memoryFile = await readWorkspaceMemoryFile(workspaceDir, false);
           const status = statuses.find((s) => String(s.agentId || "") === agentId);
           const vectorState = memoryFile.exists
