@@ -133,6 +133,8 @@ function normalizePathQuery(pathValue: string | null, workspaceValue: string | n
   if (!cleanPath) return null;
   if (cleanPath.startsWith("workspace")) return cleanPath;
   const ws = normalizeWorkspaceQuery(workspaceValue);
+  // Don't double-prefix if cleanPath already starts with the workspace name
+  if (ws && cleanPath.startsWith(ws + "/")) return cleanPath;
   return ws ? `${ws}/${cleanPath}` : cleanPath;
 }
 

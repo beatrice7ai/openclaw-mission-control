@@ -1,13 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readdir, readFile, stat, writeFile, unlink, rename, copyFile, mkdir } from "fs/promises";
 import { join, resolve, extname, dirname, basename } from "path";
-import { getOpenClawHome } from "@/lib/paths";
+import { getOpenClawHome, getDefaultWorkspaceSync } from "@/lib/paths";
 
 const OPENCLAW_HOME = getOpenClawHome();
+const WORKSPACE_DIR = getDefaultWorkspaceSync();
+const WORKSPACE_NAME = WORKSPACE_DIR.split("/").filter(Boolean).pop() || "workspace";
 
-/** Resolve a user-supplied path safely within OPENCLAW_HOME. Returns null if traversal is detected. */
+/** Resolve a user-supplied path safely within OPENCLAW_HOME or WORKSPACE_DIR. Returns null if traversal is detected. */
 function safePath(filePath: string): string | null {
   const cleaned = filePath.replace(/^\/+/, "");
+  // If path starts with the external workspace name, resolve relative to its parent
+  if (WORKSPACE_DIR && cleaned.startsWith(WORKSPACE_NAME + "/")) {
+    const wsParent = WORKSPACE_DIR.substring(0, WORKSPACE_DIR.length - WORKSPACE_NAME.length);
+    const full = resolve(wsParent, cleaned);
+    if (full.startsWith(WORKSPACE_DIR + "/") || full === WORKSPACE_DIR) return full;
+  }
   const full = resolve(OPENCLAW_HOME, cleaned);
   if (!full.startsWith(OPENCLAW_HOME + "/") && full !== OPENCLAW_HOME) return null;
   return full;
@@ -39,14 +47,27 @@ type FileInfo = {
 };
 
 async function discoverWorkspaces(): Promise<{ name: string; dir: string }[]> {
+  const workspaces: { name: string; dir: string }[] = [];
+  // Include external workspace from OPENCLAW_WORKSPACE env var
+  if (WORKSPACE_DIR && WORKSPACE_NAME) {
+    try {
+      const s = await stat(WORKSPACE_DIR);
+      if (s.isDirectory()) {
+        workspaces.push({ name: WORKSPACE_NAME, dir: WORKSPACE_DIR });
+      }
+    } catch { /* workspace dir does not exist */ }
+  }
   try {
     const entries = await readdir(OPENCLAW_HOME, { withFileTypes: true });
-    return entries
-      .filter((e) => e.isDirectory() && e.name.startsWith("workspace"))
-      .map((e) => ({ name: e.name, dir: join(OPENCLAW_HOME, e.name) }));
-  } catch {
-    return [];
-  }
+    for (const e of entries) {
+      if (e.isDirectory() && e.name.startsWith("workspace")) {
+        if (!workspaces.some((w) => w.name === e.name)) {
+          workspaces.push({ name: e.name, dir: join(OPENCLAW_HOME, e.name) });
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return workspaces;
 }
 
 async function scanDir(
